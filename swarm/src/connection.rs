@@ -411,57 +411,25 @@ where
                 }
             }
 
-            // Find the next *Waiting* substream request to pair with a newly
-            // muxer-ready outbound stream.
-            //
-            // We must skip any `SubstreamRequested::Done` entries: `extract()`
-            // transitions the state to `Done` but does not remove the entry
-            // from `requested_substreams` directly — that removal is driven
-            // by the entry's own `Future::poll` returning `Ready(Ok(()))` on
-            // the next `requested_substreams.poll_next_unpin(cx)` call, after
-            // its waker is woken from inside `extract()`.
-            //
-            // That cleanup pass relies on `extracted_waker` being `Some` at
-            // the moment `extract()` runs. The waker is populated by the
-            // `Future::poll` impl when it observes `Poll::Pending` from the
-            // timeout (see the `Waiting` arm of `<SubstreamRequested as
-            // Future>::poll` below), but extraction can happen *before* the
-            // future ever reaches a `Pending` poll: either because the muxer
-            // returned `poll_outbound = Ready` on the same loop iteration as
-            // the request was pushed, or — more subtly — because
-            // `FuturesUnordered`'s ordering for newly-pushed entries means
-            // `iter_mut().next()` can land on an entry that has not yet
-            // completed its initial `Pending` poll. In that case the
-            // `extracted_waker` is `None`, no wake is scheduled, and the
-            // `Done` entry persists until *some other* event drives a poll
-            // of this connection.
-            //
-            // Without this filter, the next outbound-ready iteration's
-            // `iter_mut().next()` would land on that stale `Done` entry and
-            // `extract()` would panic with "cannot extract twice".
-            //
-            // Filtering at extraction time is the precise expression of the
-            // intent ("find a waiting request to fulfil") and is robust
-            // regardless of `FuturesUnordered`'s internal poll-ordering. The
-            // alternative — removing `Done` entries eagerly — is not possible
-            // through `FuturesUnordered`'s public API while iterating it.
-            if let Some(requested_substream) = requested_substreams
-                .iter_mut()
-                .find(|r| matches!(r, SubstreamRequested::Waiting { .. }))
+            // `extract()` leaves `Done` entries behind until `poll_next`
+            // removes them. Skip those stale entries and fulfill the next
+            // request that is still waiting.
+            if let Some(requested_substream) =
+                requested_substreams.iter_mut().find(|r| r.is_waiting())
             {
                 match muxing.poll_outbound_unpin(cx)? {
                     Poll::Pending => {}
                     Poll::Ready(substream) => {
-                        let (user_data, timeout, upgrade) = requested_substream.extract();
-
-                        negotiating_out.push(StreamUpgrade::new_outbound(
-                            substream,
-                            user_data,
-                            timeout,
-                            upgrade,
-                            *substream_upgrade_protocol_override,
-                            stream_counter.clone(),
-                        ));
+                        if let Some((user_data, timeout, upgrade)) = requested_substream.extract() {
+                            negotiating_out.push(StreamUpgrade::new_outbound(
+                                substream,
+                                user_data,
+                                timeout,
+                                upgrade,
+                                *substream_upgrade_protocol_override,
+                                stream_counter.clone(),
+                            ));
+                        }
 
                         // Go back to the top,
                         // handler can potentially make progress again.
@@ -728,7 +696,11 @@ impl<UserData, Upgrade> SubstreamRequested<UserData, Upgrade> {
         }
     }
 
-    fn extract(&mut self) -> (UserData, Delay, Upgrade) {
+    fn is_waiting(&self) -> bool {
+        matches!(self, SubstreamRequested::Waiting { .. })
+    }
+
+    fn extract(&mut self) -> Option<(UserData, Delay, Upgrade)> {
         match mem::replace(self, Self::Done) {
             SubstreamRequested::Waiting {
                 user_data,
@@ -740,9 +712,9 @@ impl<UserData, Upgrade> SubstreamRequested<UserData, Upgrade> {
                     waker.wake();
                 }
 
-                (user_data, timeout, upgrade)
+                Some((user_data, timeout, upgrade))
             }
-            SubstreamRequested::Done => panic!("cannot extract twice"),
+            SubstreamRequested::Done => None,
         }
     }
 }
@@ -893,55 +865,20 @@ mod tests {
     }
 
     /// Regression test for "cannot extract twice".
-    ///
-    /// Constructs the minimal failure shape directly on a `FuturesUnordered`:
-    /// push a `SubstreamRequested` and call `extract()` *before* the future
-    /// has been polled, so `extracted_waker` is `None`. The entry is now in
-    /// `Done` state but lacks the wake call that would let
-    /// `poll_next` clean it up.
-    ///
-    /// Before the fix, `iter_mut().next()` would return that stale `Done`
-    /// entry on the next outbound-ready iteration of `Connection::poll`,
-    /// and `extract()` would panic. After the fix, the iter site filters to
-    /// `Waiting` entries only — no panic, and the `Done` entry is allowed to
-    /// be cleaned up by a later `poll_next` whenever its waker (or
-    /// `FuturesUnordered`'s internal scheduling) drives it.
     #[test]
-    fn iter_mut_skips_done_substream_requested_entries() {
-        let mut requested: FuturesUnordered<SubstreamRequested<(), DeniedUpgrade>> =
-            FuturesUnordered::new();
-
-        // Two pushes that are never `poll_next`'d, so neither future has stored
-        // a waker — this mirrors the bug condition where extraction races
-        // ahead of the future's first `Poll::Pending`.
-        requested.push(SubstreamRequested::new((), Duration::from_secs(60), DeniedUpgrade));
-        requested.push(SubstreamRequested::new((), Duration::from_secs(60), DeniedUpgrade));
-
-        // First extraction: pick a Waiting entry and extract.
-        let first = requested
-            .iter_mut()
-            .find(|r| matches!(r, SubstreamRequested::Waiting { .. }))
-            .expect("first call must find a Waiting entry");
-        let _ = first.extract();
-
-        // After extract, one entry is Done. `iter_mut().next()` *would*
-        // surface that Done — the filter must skip past it to the remaining
-        // Waiting entry.
-        let second = requested
-            .iter_mut()
-            .find(|r| matches!(r, SubstreamRequested::Waiting { .. }))
-            .expect("second call must skip the Done entry and find the other Waiting");
-        let _ = second.extract();
-
-        // After both extracts, all entries are Done. `find(Waiting)` returns
-        // None. Critically, no panic.
-        assert!(
-            requested
-                .iter_mut()
-                .find(|r| matches!(r, SubstreamRequested::Waiting { .. }))
-                .is_none(),
-            "no Waiting entries remain; the filter must not surface Done entries"
+    fn connection_poll_skips_done_substream_requested_entries() {
+        let mut connection = Connection::new(
+            StreamMuxerBox::new(ReadyOutboundStreamMuxer { remaining: 2 }),
+            MockConnectionHandler::new(Duration::from_secs(10)),
+            None,
+            0,
+            Duration::ZERO,
         );
+
+        connection.handler.open_outbound_substreams(2);
+
+        let _ = connection.poll_noop_waker();
+        let _ = connection.poll_noop_waker();
     }
 
     #[test]
@@ -1187,6 +1124,47 @@ mod tests {
         }
     }
 
+    /// A [`StreamMuxer`] which immediately returns outbound streams.
+    struct ReadyOutboundStreamMuxer {
+        remaining: usize,
+    }
+
+    impl StreamMuxer for ReadyOutboundStreamMuxer {
+        type Substream = PendingSubstream;
+        type Error = Infallible;
+
+        fn poll_inbound(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<Self::Substream, Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_outbound(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<Self::Substream, Self::Error>> {
+            if self.remaining == 0 {
+                return Poll::Pending;
+            }
+
+            self.remaining -= 1;
+
+            Poll::Ready(Ok(PendingSubstream { _weak: Weak::new() }))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Result<StreamMuxerEvent, Self::Error>> {
+            Poll::Pending
+        }
+    }
+
     struct PendingSubstream {
         _weak: Weak<()>,
     }
@@ -1220,7 +1198,7 @@ mod tests {
     }
 
     struct MockConnectionHandler {
-        outbound_requested: bool,
+        outbound_requested: usize,
         error: Option<StreamUpgradeError<Infallible>>,
         upgrade_timeout: Duration,
     }
@@ -1228,14 +1206,18 @@ mod tests {
     impl MockConnectionHandler {
         fn new(upgrade_timeout: Duration) -> Self {
             Self {
-                outbound_requested: false,
+                outbound_requested: 0,
                 error: None,
                 upgrade_timeout,
             }
         }
 
         fn open_new_outbound(&mut self) {
-            self.outbound_requested = true;
+            self.open_outbound_substreams(1);
+        }
+
+        fn open_outbound_substreams(&mut self, count: usize) {
+            self.outbound_requested += count;
         }
     }
 
@@ -1320,8 +1302,8 @@ mod tests {
             &mut self,
             _: &mut Context<'_>,
         ) -> Poll<ConnectionHandlerEvent<Self::OutboundProtocol, (), Self::ToBehaviour>> {
-            if self.outbound_requested {
-                self.outbound_requested = false;
+            if self.outbound_requested > 0 {
+                self.outbound_requested -= 1;
                 return Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest {
                     protocol: SubstreamProtocol::new(DeniedUpgrade, ())
                         .with_timeout(self.upgrade_timeout),
