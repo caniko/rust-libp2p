@@ -1,16 +1,29 @@
 ## 0.50.0
+- Enforce RPC size limits on each declared payload, excluding its prefix and subsequent buffered frames.
+  See [PR 6427](https://github.com/libp2p/rust-libp2p/pull/6427).
+
+- Account for forwarded messages in `topic_mesg_sent_*` metrics.
+  See [PR 6502](https://github.com/libp2p/rust-libp2p/pull/6502)
+
+- Simplify gossipsub control message validation by scanning protobuf bytes before decoding
+  to validate cumulative control message size, rather than decoding then counting individual IDs
+  to prevent memory amplification from decoding.
+  Introduce `max_control_message_size` (default 16KB) to limit total control bytes in an RPC.
+  Rename `max_ihave_messages` to `max_ihave_messages_heartbeat`.
+  Rename `max_control_messages` to `max_control_messages_sent`.
+  See [PR #6486](https://github.com/libp2p/rust-libp2p/pull/6486)
+
 - Send all topic subscriptions in a single hello RPC when connecting to a new peer, aligning with the GossipSub spec and other implementations (Go, Nim, JS).
   See [PR 6385](https://github.com/libp2p/rust-libp2p/pull/6385).
+
 - Raise MSRV to 1.88.0.
   See [PR 6273](https://github.com/libp2p/rust-libp2p/pull/6273).
 
+- Revert migration to `quick-protobuf`, migrate back to `prost`.
+  See [PR 6363](https://github.com/libp2p/rust-libp2p/pull/6363).
+
 - Optimize IDONTWANT sending by avoiding broadcasts for already-seen messages and deduplicating recipient peers.
   See [PR 6356](https://github.com/libp2p/rust-libp2p/pull/6356)
-
-- Unify gossipsub control-message limits under max_control_messages (replacing per-type control ID caps),
-  and truncate control vectors immediately after RPC decode.
-  rename `max_ihave_messages` to `max_ihave_messages_heartbeat`.
-  See [PR 6409](https://github.com/libp2p/rust-libp2p/pull/6409)
 
 - Rename metric `topic_msg_sent_bytes` to `topic_msg_last_sent_bytes` for accuracy.
   See [PR 6283](https://github.com/libp2p/rust-libp2p/pull/6283)

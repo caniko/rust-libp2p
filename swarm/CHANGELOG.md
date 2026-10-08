@@ -1,10 +1,24 @@
 ## 0.48.0
 
+- Stagger public and relay dials after private addresses and classify localhost DNS names correctly.
+  See [PR 6427](https://github.com/libp2p/rust-libp2p/pull/6427).
+
 - Remove `wasm-bindgen` feature and make `wasm` support implicit.
   See [PR 6102](https://github.com/libp2p/rust-libp2p/pull/6102)
 
 - Raise MSRV to 1.88.0.
   See [PR 6273](https://github.com/libp2p/rust-libp2p/pull/6273).
+
+- Fix `panic!("cannot extract twice")` in `Connection::poll` by selecting
+  a `Waiting` `SubstreamRequested` explicitly instead of the first entry,
+  which could be a stale `Done` left behind by a prior extraction.
+  See [PR 6427](https://github.com/libp2p/rust-libp2p/pull/6427).
+
+- Add smart dialing support (`with_smart_dial`).
+  Ranks dial addresses by transport priority (QUIC > TCP, IPv6 > IPv4)
+  with Happy Eyeballs (RFC 8305) staggered delays. All addresses are
+  dialed concurrently.
+  See [PR 6229](https://github.com/libp2p/rust-libp2p/pull/6229).
 
 ## 0.47.1
 
